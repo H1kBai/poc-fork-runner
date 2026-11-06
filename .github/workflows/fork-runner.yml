@@ -1,0 +1,16 @@
+name: fork-runner
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '13,43 * * * *'
+jobs:
+  fork:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python fork_actions.py
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
