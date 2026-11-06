@@ -39,16 +39,26 @@ def to_private(full):
     return False
 
 repos = [l.strip() for l in open("repos.txt") if l.strip()]
-done = set()
+# private fork 脱离 fork 网络(parent=None), 改按仓库名断点:
+# 新规则 owner__repo(唯一); 旧规则 原repo名(仅无同名冲突时兼容已fork的)
+from collections import Counter
+name_cnt = Counter(r.split("/", 1)[1].lower() for r in repos)
+have_names = set()
 page = 1
 while page <= 10:
     st, lst = api("/user/repos?per_page=100&page=%d&type=owner" % page)
     if st != 200 or not lst:
         break
     for r in lst:
-        if r.get("fork") and r.get("parent"):
-            done.add(r["parent"]["full_name"].lower())
+        have_names.add(r["name"].lower())
     page += 1
+done = set()
+for r in repos:
+    o, n = r.split("/", 1)
+    if (o.lower() + "__" + n.lower()) in have_names:
+        done.add(r.lower())
+    elif name_cnt[n.lower()] == 1 and n.lower() in have_names:
+        done.add(r.lower())
 pending = [r for r in repos if r.lower() not in done]
 print("总 %d | 断点 %d | 本次待处理 %d" % (len(repos), len(done), len(pending)), flush=True)
 if not pending:
@@ -62,14 +72,17 @@ for i, repo in enumerate(pending, 1):
     if time.time() - t0 > BUDGET:
         print("TIME-UP 成功%d 剩余约%d 下个调度续跑" % (n_ok, len(pending) - i + 1), flush=True)
         sys.exit(0)
-    st, body = api("/repos/%s/forks" % repo, "POST", {"default_branch_only": True})
+    fork_name = repo.replace("/", "__")
+    st, body = api("/repos/%s/forks" % repo, "POST",
+                   {"default_branch_only": True, "name": fork_name})
     while st == 403 and "empty" not in str(body.get("message", "")).lower():
         print("  RATE 冷却%ds: %s" % (cool, repo), flush=True)
         time.sleep(cool)
         cool = min(cool + 300, 3600)
-        st, body = api("/repos/%s/forks" % repo, "POST", {"default_branch_only": True})
+        st, body = api("/repos/%s/forks" % repo, "POST",
+                       {"default_branch_only": True, "name": fork_name})
     if st in (200, 202):
-        full = body.get("full_name", ME + "/" + repo.split("/", 1)[1])
+        full = body.get("full_name", ME + "/" + fork_name)
         priv = to_private(full)
         n_ok += 1
         cool = max(300, cool - 300)
@@ -79,7 +92,7 @@ for i, repo in enumerate(pending, 1):
         n_gone += 1
         print("404 %s 失联" % repo, flush=True)
     elif st == 422:
-        to_private(ME + "/" + repo.split("/", 1)[1])
+        to_private(ME + "/" + fork_name)
         n_ok += 1
         print("422 %s 已存在转私" % repo, flush=True)
     elif st == 403:
