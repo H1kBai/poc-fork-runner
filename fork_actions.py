@@ -41,17 +41,28 @@ def mirror_one(owner_repo, name):
         return "CREATE-FAIL %s" % st
     d = "m_%s" % name.replace("/", "_")
     subprocess.run(["rm", "-rf", d], cwd="/tmp")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+               GIT_CONFIG_GLOBAL="/tmp/mgitcfg")
+    with open("/tmp/mgitcfg", "w") as f:
+        f.write("[credential]
+	helper =
+[user]
+	name = %s
+	email = %s@users.noreply.github.com
+" % (ME, ME))
     c = subprocess.run(["git", "clone", "--bare", "https://github.com/%s.git" % owner_repo, d],
-                       cwd="/tmp", capture_output=True, text=True, timeout=900)
+                       cwd="/tmp", capture_output=True, text=True, timeout=900, env=env)
     if c.returncode != 0:
         subprocess.run(["rm", "-rf", d], cwd="/tmp")
-        return "CLONE-FAIL " + c.stderr.strip()[:60]
+        return "CLONE-FAIL[%d] %s" % (c.returncode, c.stderr.strip().replace("
+", " | ")[:150])
     p = subprocess.run(["git", "push", "--mirror",
-        "https://x-access-token:%s@github.com/%s/%s.git" % (TOK, ME, name)],
-        cwd="/tmp/" + d, capture_output=True, text=True, timeout=900)
+        "https://%s@github.com/%s/%s.git" % (TOK, ME, name)],
+        cwd="/tmp/" + d, capture_output=True, text=True, timeout=900, env=env)
     subprocess.run(["rm", "-rf", d], cwd="/tmp")
     if p.returncode != 0:
-        return "PUSH-FAIL " + p.stderr.strip()[:60]
+        return "PUSH-FAIL[%d] %s" % (p.returncode, p.stderr.strip().replace("
+", " | ")[:150])
     # 确认转私
     api("/repos/%s/%s" % (ME, name), "PATCH", {"private": True})
     return "OK" + ("(新建)" if created else "(补推)")
