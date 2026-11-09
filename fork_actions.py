@@ -1,23 +1,24 @@
 # -*- coding: utf-8 -*-
-"""GitHub Actions 版 fork 执行器。
-断点=账号现有 fork 的上游; 90s/个; 403递增冷却; 300分钟让位给下个调度。"""
-import json, os, sys, time, urllib.request, urllib.error
+"""私有镜像补全执行器（替代原 fork 逻辑；由 fork-runner.yml 调用，文件名保持不变）。
+对 repos.txt 每个上游: 创建 H1kBai/owner__repo 私有仓 -> bare clone 上游 -> push --mirror。
+断点=账号已存在该仓且 size>0; 温和限速; 280分钟让位。绝不调用 fork API。"""
+import json, os, subprocess, sys, time, urllib.request, urllib.error
 sys.stdout.reconfigure(encoding="utf-8")
 
 TOK = os.environ["GH_TOKEN"]
 ME = "H1kBai"
-BUDGET = 300 * 60
+BUDGET = 280 * 60
 
 def api(path, method="GET", data=None):
     req = urllib.request.Request("https://api.github.com" + path,
         data=json.dumps(data).encode() if data is not None else None,
-        headers={"Authorization": "Bearer " + TOK, "User-Agent": "fork-runner",
+        headers={"Authorization": "Bearer " + TOK, "User-Agent": "mirror-bot",
                  "Accept": "application/vnd.github+json",
                  "Content-Type": "application/json"}, method=method)
     try:
         r = urllib.request.urlopen(req, timeout=30)
         b = r.read()
-        return r.status, (json.loads(b) if b else {})
+        return r.status, json.loads(b) if b else {}
     except urllib.error.HTTPError as e:
         b = e.read()
         try:
@@ -27,83 +28,85 @@ def api(path, method="GET", data=None):
     except Exception as e:
         return -1, {"message": type(e).__name__}
 
-def to_private(full):
-    for _ in range(6):
-        st, _b = api("/repos/" + full, "PATCH", {"private": True})
-        if st == 200:
-            return True
-        if st == 404:
-            time.sleep(10)
-            continue
-        time.sleep(5)
-    return False
+def repo_info(name):
+    st, r = api("/repos/%s/%s" % (ME, name))
+    return (st, r) if st == 200 else (st, {})
+
+def mirror_one(owner_repo, name):
+    """创建私有仓(若缺) + 推送完整镜像。返回状态串"""
+    st, _ = api("/user/repos", "POST", {"name": name, "private": True,
+                                        "description": "mirror of " + owner_repo})
+    created = (st == 201)
+    if st not in (201, 422):
+        return "CREATE-FAIL %s" % st
+    d = "m_%s" % name.replace("/", "_")
+    subprocess.run(["rm", "-rf", d], cwd="/tmp")
+    c = subprocess.run(["git", "clone", "--bare", "https://github.com/%s.git" % owner_repo, d],
+                       cwd="/tmp", capture_output=True, text=True, timeout=900)
+    if c.returncode != 0:
+        subprocess.run(["rm", "-rf", d], cwd="/tmp")
+        return "CLONE-FAIL " + c.stderr.strip()[:60]
+    p = subprocess.run(["git", "push", "--mirror",
+        "https://x-access-token:%s@github.com/%s/%s.git" % (TOK, ME, name)],
+        cwd="/tmp/" + d, capture_output=True, text=True, timeout=900)
+    subprocess.run(["rm", "-rf", d], cwd="/tmp")
+    if p.returncode != 0:
+        return "PUSH-FAIL " + p.stderr.strip()[:60]
+    # 确认转私
+    api("/repos/%s/%s" % (ME, name), "PATCH", {"private": True})
+    return "OK" + ("(新建)" if created else "(补推)")
 
 repos = [l.strip() for l in open("repos.txt") if l.strip()]
-# private fork 脱离 fork 网络(parent=None), 改按仓库名断点:
-# 新规则 owner__repo(唯一); 旧规则 原repo名(仅无同名冲突时兼容已fork的)
-from collections import Counter
-name_cnt = Counter(r.split("/", 1)[1].lower() for r in repos)
-have_names = set()
+have = {}
 page = 1
-while page <= 10:
+while page <= 12:
     st, lst = api("/user/repos?per_page=100&page=%d&type=owner" % page)
     if st != 200 or not lst:
         break
     for r in lst:
-        have_names.add(r["name"].lower())
+        have[r["name"].lower()] = r.get("size", 0)
     page += 1
-done = set()
+
+todo, empty, done = [], [], 0
 for r in repos:
-    o, n = r.split("/", 1)
-    if (o.lower() + "__" + n.lower()) in have_names:
-        done.add(r.lower())
-    elif name_cnt[n.lower()] == 1 and n.lower() in have_names:
-        done.add(r.lower())
-pending = [r for r in repos if r.lower() not in done]
-print("总 %d | 断点 %d | 本次待处理 %d" % (len(repos), len(done), len(pending)), flush=True)
-if not pending:
-    print("DONE-ALL", flush=True)
-    sys.exit(0)
-
-n_ok = n_gone = n_bad = 0
-t0 = time.time()
-cool = 300
-for i, repo in enumerate(pending, 1):
-    if time.time() - t0 > BUDGET:
-        print("TIME-UP 成功%d 剩余约%d 下个调度续跑" % (n_ok, len(pending) - i + 1), flush=True)
-        sys.exit(0)
-    fork_name = repo.replace("/", "__")
-    st, body = api("/repos/%s/forks" % repo, "POST",
-                   {"default_branch_only": True, "name": fork_name})
-    while st == 403 and "empty" not in str(body.get("message", "")).lower():
-        print("  RATE 冷却%ds: %s" % (cool, repo), flush=True)
-        time.sleep(cool)
-        cool = min(cool + 300, 3600)
-        st, body = api("/repos/%s/forks" % repo, "POST",
-                       {"default_branch_only": True, "name": fork_name})
-    if st in (200, 202):
-        full = body.get("full_name", ME + "/" + fork_name)
-        priv = to_private(full)
-        n_ok += 1
-        cool = max(300, cool - 300)
-        print("OK %d/%d %s -> %s %s" % (i, len(pending), repo, full,
-              "[私]" if priv else "[转私失败!]"), flush=True)
-    elif st == 404:
-        n_gone += 1
-        print("404 %s 失联" % repo, flush=True)
-    elif st == 422:
-        to_private(ME + "/" + fork_name)
-        n_ok += 1
-        print("422 %s 已存在转私" % repo, flush=True)
-    elif st == 403:
-        n_bad += 1
-        print("EMPTY %s 空仓库" % repo, flush=True)
+    key = r.replace("/", "__").lower()
+    if key not in have:
+        todo.append(r)
+    elif have[key] == 0:
+        empty.append(r)
     else:
-        n_bad += 1
-        print("ERR %s -> %s %s" % (repo, st, str(body.get("message", ""))[:60]), flush=True)
-    time.sleep(90)
+        done += 1
+print("总 %d | 已完成 %d | 待创建 %d | 待补推空仓 %d" % (len(repos), done, len(todo), len(empty)), flush=True)
 
-left = len(pending) - n_ok - n_gone - n_bad
-print("DONE 本次成功%d 失联%d 其他失败%d 剩余%d" % (n_ok, n_gone, n_bad, left), flush=True)
+fails = []
+t0 = time.time()
+work = [(r, "create") for r in todo] + [(r, "refill") for r in empty]
+for i, (r, kind) in enumerate(work, 1):
+    if time.time() - t0 > BUDGET:
+        print("TIME-UP 剩余 %d, 下个调度续跑" % (len(work) - i + 1), flush=True)
+        sys.exit(0)
+    name = r.replace("/", "__")
+    try:
+        s = mirror_one(r, name)
+    except subprocess.TimeoutExpired:
+        s = "TIMEOUT"
+    except Exception as e:
+        s = "ERR " + type(e).__name__
+    if not s.startswith("OK"):
+        fails.append((r, s))
+    print("[%d/%d][%s] %s -> %s" % (i, len(work), kind, r, s), flush=True)
+    time.sleep(45)
+
+print("FAILS: %d" % len(fails), flush=True)
+for r, s in fails:
+    print("  FAIL %s %s" % (r, s), flush=True)
+# 完成判定: 重查 size
+left = 0
+for r in repos:
+    key = r.replace("/", "__").lower()
+    st, info = repo_info(r.replace("/", "__"))
+    if st != 200 or info.get("size", 0) == 0:
+        left += 1
+print("DONE 剩余未完成 %d" % left, flush=True)
 if left == 0:
-    print("DONE-ALL", flush=True)
+    print("DONE-ALL 全部私有镜像完成", flush=True)
